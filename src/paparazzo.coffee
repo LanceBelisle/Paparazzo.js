@@ -15,7 +15,6 @@ EventEmitter = require('events').EventEmitter
 class Paparazzo extends EventEmitter
 
   @image = ''
-  imageExpectedLength = -1
 
   constructor: (options) ->
 
@@ -27,6 +26,7 @@ class Paparazzo extends EventEmitter
     options.headers or= {}
     @options = options
     @memory = options.memory or 8388608 # 8MB
+    @data=''
 
   start: ->
 
@@ -81,49 +81,50 @@ class Paparazzo extends EventEmitter
   # \r\n
   #
   ###
+  
   handleServerResponse: (chunk) =>
-    boundary_index = chunk.indexOf(@boundary)
-
-    # If a boundary is found, generate a new image from the data accumulated up to the boundary.
-    # Otherwise keep eating. We will probably find a boundary in the next chunk.
-    if boundary_index != -1
-      # Append remaining data
-      @data += chunk.substring 0, boundary_index
-      # Now we got a new image
-      @image = @data
-      @emit 'update', @image
-
-      # Start over
-      @data = ''
-      # Grab the remaining bytes of chunk
-      remaining = chunk.substring boundary_index
-      # Try to find the type of the next image
-      typeMatches = remaining.match /Content-Type:\s+image\/jpeg\s+/
-      # Try to find the length of the next image
-      matches = remaining.match /Content-Length:\s+(\d+)\s+/
-
-      if matches? and matches.length > 1
-        # Grab length of new image and save first chunk
-        newImageBeginning = remaining.indexOf(matches[0]) + matches[0].length
-        @imageExpectedLength = matches[1]
-        @data += remaining.substring newImageBeginning
-      else if typeMatches?
-        # If Content-Length is not present, but Content-Type is
-        newImageBeginning = remaining.indexOf(typeMatches[0]) + typeMatches[0].length
-        @data += remaining.substring newImageBeginning
-      else
-        newImageBeginning = boundary_index + @boundary.length
+    @data += chunk
+    first_boundary_index = @data.indexOf @boundary
+    if first_boundary_index == -1 
+      if @data.length >= @memory
+        @data = ''
         @emit 'error',
-          message: 'Could not find beginning of next image'
-    else
-      @data += chunk
-
-    # Threshold to avoid memory over-consumption
-    # E.g. if a boundary string is never found, 'data' will never stop consuming memory
-    if @data.length >= @memory
-      @data = ''
+          message: 'Data buffer just reached threshold, flushing memory'
+      return 
+    #process MJPEG boundary header
+    typeMatches = @data.substr(first_boundary_index,100).match /Content-Type:\s+image\/jpeg\s+/
+    lengthMatches = @data.substr(first_boundary_index,160).match /Content-Length:\s+(\d+)\s+/
+    if lengthMatches? and lengthMatches.length > 1
+      # Grab length of image
+      imageBeginning = @data.indexOf(lengthMatches[0]) + lengthMatches[0].length
+      imageExpectedLength = parseInt lengthMatches[1], 10
+      if imageExpectedLength + imageBeginning <= @data.length
+        #Now we got a new image
+        @image = @data.substr imageBeginning, imageExpectedLength
+        @emit 'update', @image
+        @data = @data.substring imageBeginning+imageExpectedLength
+        @handleServerResponse('') #re-curse just in case we got two JPEGs at a time
+    else if typeMatches?
+      # If Content-Length is not present, but Content-Type is
+      imageBeginning = @data.indexOf(typeMatches[0]) + typeMatches[0].length
+      #look for 2nd boundary
+      second_boundary_index = @data.indexOf @boundary, imageBeginning
+      if second_boundary_index == -1
+        return # wait for next chunk
+      @image = @data.substring imageBeginning, second_boundary_index
+      @emit 'update', @image
+      @data = @data.substring second_boundary_index
+      @handleServerResponse('') #re-curse just in case we got two JPEGs at a time
+    else #look for 2nd boundary
+      second_boundary_index = @data.indexOf @boundary, first_boundary_index+@boundary.length
+      if second_boundary_index == -1
+        return # wait for next chunk
+      @image = @data.substring first_boundary_index+@boundary.length, second_boundary_index
+      @emit 'update', @image
+      @data = @data.substring second_boundary_index
+      chunk=''
+      @handleServerResponse('') #re-curse just in case we got two JPEGs at a time
       @emit 'error',
-        message: 'Data buffer just reached threshold, flushing memory'
-
+        message: 'Could not find beginning of next image'
 
 module.exports = Paparazzo
